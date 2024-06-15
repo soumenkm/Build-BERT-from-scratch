@@ -1,0 +1,11 @@
+torch_pg.py
+__pycache__
+.vscode
+.DS_Store
+*.pth
+data
+bert_model/google_bert
+fine_tuning/datasets
+fine_tuning/model_ckpt
+fine_tuning/outputs
+ckpt
