@@ -68,7 +68,7 @@ class BertPreTrainDataset(torch.utils.data.Dataset):
         segment_pad = [0] * extra_len
         assert len(padded_sequence) == self.max_context_legth, f"{len(padded_sequence)} must be equal to {self.max_context_legth}"
 
-        pad_attention_mask_tensor = torch.tensor([0] * len(sequence) + [-torch.inf] * extra_len)
+        pad_attention_mask_tensor = torch.tensor([1] * len(sequence) + [0] * extra_len) # 1 for real token and 0 for padding token. They will be converted to -inf to calculate the softmax probability
         segment_id_tensor = torch.tensor(segment_A + segment_B + segment_pad)
         is_next_tensor = torch.tensor(raw_example[0])
         
