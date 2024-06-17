@@ -48,7 +48,7 @@ class BertAttention(torch.nn.Module):
         self.Tmax = max_context_legth
         
         self.multihead_self_attention = torch.nn.MultiheadAttention(embed_dim=self.d, num_heads=self.h, dropout=0.0, bias=True, batch_first=True)
-        self.attention_out_projection = torch.nn.Linear(in_features=self.d, out_features=self.d, bias=True)
+        # self.attention_out_projection = torch.nn.Linear(in_features=self.d, out_features=self.d, bias=True) # MHA automatically adds an out_proj layer
         self.layernorm = torch.nn.LayerNorm(normalized_shape=self.d)
         self.dropout = torch.nn.Dropout(p=self.p)
     
@@ -62,7 +62,7 @@ class BertAttention(torch.nn.Module):
         x = self.multihead_self_attention(query=inputs, key=inputs, value=inputs, 
                                           key_padding_mask=padding_mask, need_weights=False, 
                                           is_causal=False)[0] # (b, T, d)
-        x = self.attention_out_projection(x) # (b, T, d)
+        # x = self.attention_out_projection(x) # (b, T, d)
         x = x + inputs # (b, T, d)
         x = self.layernorm(x) # (b, T, d)
         x = self.dropout(x) # (b, T, d)
@@ -200,10 +200,7 @@ def main():
     segment_ids = torch.randint(low=0, high=2, size=(batch_size, config["max_context_length"]))
     
     model = Bert(config=config)
-    torchinfo.summary(model)
-    
-    y = model(inputs, segment_ids, padding_mask)
-    print(y.shape)
+    print(model)
     
 if __name__ == "__main__":
     
