@@ -53,12 +53,12 @@ class BertAttention(torch.nn.Module):
         self.dropout = torch.nn.Dropout(p=self.p)
     
     def forward(self, inputs: torch.tensor, padding_mask: torch.tensor) -> torch.tensor:
-        
+        """padding mask has 1 means padded and 0 means real"""
         assert inputs.shape[-2] <= self.Tmax and inputs.shape[-1] == self.d and inputs.dim() == 3, f"inputs.shape = {inputs.shape} can be at most (b, {self.Tmax}, {self.d})"
         assert padding_mask.shape[-1] <= self.Tmax and padding_mask.dim() == 2, f"padding_mask.shape = {padding_mask.shape} can be at most (b, {self.Tmax})"
         assert padding_mask.unique().sum() in [0, 1], f"padding_mask = {padding_mask.unique()} should be of only 0 or 1"
         
-        padding_mask = (padding_mask == 0) # pytorch expects True means mask and False means real   
+        padding_mask = (padding_mask == 1) # pytorch expects True means mask and False means real   
         x = self.multihead_self_attention(query=inputs, key=inputs, value=inputs, 
                                           key_padding_mask=padding_mask, need_weights=False, 
                                           is_causal=False)[0] # (b, T, d)
@@ -172,14 +172,26 @@ class Bert(torch.nn.Module):
         self.encoder = BertEncoder(embedding_dim=self.d, num_heads=self.h, max_context_legth=self.Tmax, num_layers=self.L, dropout_prob=self.p)
         self.pooler = BertPooler(embedding_dim=self.d, max_context_legth=self.Tmax)
         
-    def forward(self, inputs: torch.tensor, segment_ids: torch.tensor, padding_mask: torch.tensor) -> torch.tensor:
-        """inputs.shape = (b, T), segment_ids.shape = (b, T), padding_mask.shape = (b, T)"""
+    def forward(self, inputs: torch.tensor, segment_ids: torch.tensor=None, padding_mask: torch.tensor=None) -> torch.tensor:
+        """inputs.shape = (b, T), segment_ids.shape = (b, T), padding_mask.shape = (b, T)
+        padding_mask = 1 means it is padded token and 0 means it is real token
+        """
         
+        if segment_ids is None and padding_mask is None:
+            segment_ids = torch.zeros(size=inputs.shape, dtype=torch.int64) # all sent_A
+            padding_mask = torch.zeros(size=inputs.shape, dtype=torch.int64) # all real
+
+        elif segment_ids is None and padding_mask is not None:
+            raise ValueError("When padding_mask is provided, segment_ids cannot be None")
+            
+        elif segment_ids is not None and padding_mask is None:
+            padding_mask = torch.zeros(size=inputs.shape) # all real
+            
         x = self.embedding(inputs, segment_ids) # (b, T, d)
         x = self.encoder(x, padding_mask) # (b, T, d)
-        x = self.pooler(x) # (b, T) only for [CLS] token
+        z = self.pooler(x) # (b, d) only for [CLS] token
         
-        return x
+        return x, z # hidden and pooled output
 
 def main():
     

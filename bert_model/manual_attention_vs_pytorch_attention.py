@@ -33,7 +33,7 @@ class CustomMultiheadAttention(torch.nn.Module):
         V = V.transpose(1, 2) # (b, h, T, dh)
         
         W = torch.matmul(input=Q, other=K.transpose(2, 3)) # (b, h, T, T)
-        SW = W / torch.sqrt(input=torch.tensor(self.dh).to(torch.float32).to(W.device)) # (b, h, T, T)
+        SW = W / torch.sqrt(input=torch.tensor(self.dh).to(torch.float32)) # (b, h, T, T)
         
         actual_mask = padding_mask.unsqueeze(1).unsqueeze(2).expand(*W.shape).to(torch.int64) # (b, T) -> (b, 1, 1, T) -> (b, h, T, T) 
         actual_mask = torch.where(condition=(actual_mask==1), input=torch.tensor(-torch.inf), other=torch.tensor(0.0)) # (b, T, T)
@@ -69,8 +69,8 @@ attention.load_state_dict(new_dict, strict=False)
 inputs = torch.rand(size=(2, 3, 4))
 padding_mask = torch.tensor([[1, 1, 0], [1, 1, 0]]) == 0
 
-out = attention(inputs, inputs, inputs, key_padding_mask=padding_mask, need_weights=True, average_attn_weights=False)[1]
-custom_out = custom_attention(inputs, inputs, inputs, key_padding_mask=padding_mask)[1]
+out, A = attention(inputs, inputs, inputs, key_padding_mask=padding_mask, need_weights=True, average_attn_weights=False)
+custom_out, custom_A = custom_attention(inputs, inputs, inputs, key_padding_mask=padding_mask)
 
 print(out)
 print(custom_out)

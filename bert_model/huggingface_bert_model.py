@@ -1,6 +1,6 @@
-import torch, torchinfo
-from pathlib import Path
 from transformers import BertModel, BertTokenizer
 
+tokenizer = BertTokenizer.from_pretrained("bert-base-cased")
 model = BertModel.from_pretrained("bert-base-cased")
-torchinfo.summary(model)
+
+print(model)
