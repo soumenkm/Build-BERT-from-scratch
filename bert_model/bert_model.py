@@ -1,4 +1,4 @@
-import torch, torchinfo
+import torch, torchinfo, json
 from typing import Tuple, List
 from transformers import BertTokenizer
 
@@ -193,6 +193,72 @@ class Bert(torch.nn.Module):
         
         return {"hidden_states": x, "pooled_output": z} # hidden and pooled output
 
+class BertNSP(torch.nn.Module):
+    
+    def __init__(self, embedding_dim: int):
+        super(BertNSP, self).__init__()
+        self.d = embedding_dim
+        
+        self.linear = torch.nn.Linear(in_features=self.d, out_features=2, bias=True)
+    
+    def forward(self, inputs: torch.tensor) -> torch.tensor:
+        
+        assert inputs.shape[-1] == self.d and inputs.dim() == 2, f"inputs shape {inputs.shape} must be (b, {self.d})"
+        x = self.linear(inputs) # (b, 2)
+        
+        return x # no need for softmax as loss function expects the logits and not probabilities
+
+class BertMLM(torch.nn.Module):
+    
+    def __init__(self, embedding_dim: int, vocab_size: int):
+        super(BertMLM, self).__init__()
+        self.d = embedding_dim
+        self.V = vocab_size
+        
+        self.linear = torch.nn.Linear(in_features=self.d, out_features=self.V, bias=True)
+    
+    def forward(self, inputs: torch.tensor) -> torch.tensor:
+        
+        assert inputs.shape[-1] == self.d and inputs.dim() == 3, f"inputs shape {inputs.shape} must be (b, T, {self.d})"
+        x = self.linear(inputs) # (b, V)
+        
+        return x # no need for softmax as loss function expects the logits and not probabilities
+
+class BertPretrainLM(torch.nn.Module):
+    
+    def __init__(self, config: dict, tokenizer: "BertTokenizer"):
+        super(BertPretrainLM, self).__init__()
+        self.config = config
+        self.d = self.config["embedding_dim"]
+        self.V = self.config["vocab_size"]
+        self.tokenizer = tokenizer
+        
+        self.bert = Bert(config=self.config)
+        self.nsp_head = BertNSP(embedding_dim=self.d)
+        self.mlm_head = BertMLM(embedding_dim=self.d, vocab_size=self.V)
+        
+    def forward(self, inputs: torch.tensor, segment_ids: torch.tensor, padding_mask: torch.tensor, mlm_label_mask: torch.tensor) -> dict:
+        """inputs.shape = segment_ids.shape = padding_mask.shape = token_mask.shape = mlm_label_mask.shape = (b, T)
+        segment_ids = 0 means sentence A and padding position and 1 means sentence B
+        padding_mask = 0 means it is padded token and 1 means it is real token
+        mlm_label_mask = 0 means it is masked and non zero means output should be reported
+        """
+        
+        x = self.bert(inputs=inputs, segment_ids=segment_ids, padding_mask=padding_mask)
+        pooled_out = x["pooled_output"]
+        hidden_states = x["hidden_states"]
+        
+        z1 = self.nsp_head(inputs=pooled_out) # (b, 2)
+        z2 = self.mlm_head(inputs=hidden_states) # (b, T, V)
+        
+        mlm_label_mask = (mlm_label_mask != 0).to(inputs.device) # (b, T) 
+        z3 = z2[mlm_label_mask] # (num_masks_in_entire_batch, V) -> filters the number of true in b*T elements
+
+        mlm_token_count = mlm_label_mask.to(torch.int64).sum().item()
+        assert z3.shape[0] == mlm_token_count, f"Bert outputs {z3.shape[0]} tokens but actual {mlm_token_count} tokens are used for MLM"
+        
+        return {"nsp": z1, "mlm": z3}
+        
 def main():
     
     tokenizer = BertTokenizer.from_pretrained("bert-base-cased")
@@ -211,8 +277,11 @@ def main():
     padding_mask = torch.randint(low=0, high=2, size=(batch_size, config["max_context_length"]))
     segment_ids = torch.randint(low=0, high=2, size=(batch_size, config["max_context_length"]))
     
-    model = Bert(config=config)
-    print(model)
+    model = BertPretrainLM(config=config, tokenizer=tokenizer)
+    
+    inputs = torch.randint(low=tokenizer.mask_token_id-10, high=tokenizer.mask_token_id+10, size=(32, 512))
+    out = model(inputs)
+    print(out)
     
 if __name__ == "__main__":
     

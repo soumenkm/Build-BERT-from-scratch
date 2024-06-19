@@ -251,11 +251,11 @@ class BertPreTrainDataset(torch.utils.data.Dataset):
         segment_id_batch = torch.stack(tensors=segment_id_batch, dim=0)
         
         data_dict = {
-            "input_seq_batch": input_sequence_batch,
-            "label_seq_batch": label_sequence_batch,
-            "is_next_batch": is_next_batch,
-            "pad_attn_mask_batch": pad_attention_mask_batch,
-            "segment_seq_batch": segment_id_batch
+            "input_seq_batch": input_sequence_batch, # (b, T)
+            "label_seq_batch": label_sequence_batch, # (b, T)
+            "is_next_batch": is_next_batch, # (b,)
+            "pad_attn_mask_batch": pad_attention_mask_batch, # (b, T) 
+            "segment_seq_batch": segment_id_batch # (b, T)
         }
         
         return data_dict
@@ -295,6 +295,8 @@ def main():
     
     train_dl = BertPreTrainDataset.prepare_dataloader(train_ds, batch_size=32, is_train=True)
     val_dl = BertPreTrainDataset.prepare_dataloader(val_ds, batch_size=32, is_train=True)
+    
+    print(train_dl.__iter__().__next__())
     
 if __name__ == "__main__":
     
