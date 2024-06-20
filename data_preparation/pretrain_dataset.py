@@ -236,8 +236,8 @@ def main():
     train_ds = BertPreTrainDataset(text_files_list=train_files_list, tokenizer=tokenizer, max_context_legth=512, is_train=True)
     val_ds = BertPreTrainDataset(text_files_list=val_files_list, tokenizer=tokenizer, max_context_legth=512, is_train=False)
     
-    train_dl = DatasetUtils.prepare_dataloader(train_ds, is_ddp=False, batch_size=32, is_train=True)
-    val_dl = BertPreTrainDataset.prepare_dataloader(val_ds, is_ddp=False, batch_size=32, is_train=True)
+    train_dl = DatasetUtils.prepare_dataloader(train_ds, is_ddp=False, batch_size=32, is_train=True, collate_fn=DatasetUtils.collate_fn)
+    val_dl = BertPreTrainDataset.prepare_dataloader(val_ds, is_ddp=False, batch_size=32, is_train=True, collate_fn=DatasetUtils.collate_fn)
     
     print(train_dl.__iter__().__next__())
     

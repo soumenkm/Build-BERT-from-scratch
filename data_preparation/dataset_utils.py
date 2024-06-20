@@ -41,14 +41,52 @@ class DatasetUtils:
         return data_dict
     
     @staticmethod
-    def prepare_dataloader(dataset: torch.utils.data.Dataset, is_ddp: int, batch_size: int, is_train: bool, val_frac: float=0.2, num_workers: int=1) -> torch.utils.data.DataLoader:
+    def cls_collate_fn(example_list: List[dict]) -> dict:
+        """examples_list[i] = dataset.__getitem__(i)"""
+
+        input_sequence_batch = []
+        label_batch = []
+        segment_id_batch = []
+        padding_mask_batch = []
+        length_batch = []
+        
+        for elem in example_list:
+            length_batch.append(elem["length"])
+
+        max_length = max(length_batch)
+        
+        for elem in example_list:
+            input_sequence_batch.append(torch.tensor(elem["input_seq"] + [elem["pad_token_id"]] * (max_length - elem["length"])))
+            label_batch.append(torch.tensor(elem["label"]))
+            segment_id_batch.append(torch.tensor(elem["segment_seq"] + [0] * (max_length - elem["length"])))
+            padding_mask_batch.append(torch.tensor([1] * elem["length"] + [elem["pad_token_id"]] * (max_length - elem["length"])))
+            
+        input_sequence_batch = torch.stack(tensors=input_sequence_batch, dim=0)
+        label_batch = torch.stack(tensors=label_batch, dim=0)
+        segment_id_batch = torch.stack(tensors=segment_id_batch, dim=0)
+        padding_mask_batch = torch.stack(tensors=padding_mask_batch, dim=0)
+        
+        assert input_sequence_batch.shape == segment_id_batch.shape == padding_mask_batch.shape
+        
+        data_dict = {
+            "input_seq_batch": input_sequence_batch, # (b, T)
+            "label_batch": label_batch, # (b,)
+            "length_batch": max_length, # (T)
+            "segment_seq_batch": segment_id_batch, # (b, T)
+            "pad_attn_mask_batch": padding_mask_batch # (b, T)
+        }
+        
+        return data_dict
+    
+    @staticmethod
+    def prepare_dataloader(dataset: torch.utils.data.Dataset, is_ddp: int, batch_size: int, is_train: bool, collate_fn: "function", val_frac: float=0.2, num_workers: int=1) -> torch.utils.data.DataLoader:
         
         if is_train:
             if is_ddp:
                 sampler = torch.utils.data.distributed.DistributedSampler(dataset=dataset, shuffle=True, drop_last=True)
-                train_dl = torch.utils.data.DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, shuffle=False, collate_fn=DatasetUtils.collate_fn, sampler=sampler)
+                train_dl = torch.utils.data.DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, shuffle=False, collate_fn=collate_fn, sampler=sampler)
             else:
-                train_dl = torch.utils.data.DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, shuffle=True, collate_fn=DatasetUtils.collate_fn, drop_last=True)
+                train_dl = torch.utils.data.DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, shuffle=True, collate_fn=collate_fn, drop_last=True)
         else:
             len_val_ds = len(dataset)
             indices = torch.randperm(n=len_val_ds)[:int(len_val_ds * val_frac)]

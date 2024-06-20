@@ -1,30 +1,32 @@
-import torch, tqdm, sys, torchinfo, os, json
+import torch, tqdm, sys, torchinfo, os, json, math
 from pathlib import Path
 sys.path.append(Path(__file__).parent.parent.__str__())
 from typing import List, Tuple, Union
 from transformers import BertModel, BertTokenizer
-from bert_model.bert_model import BertPretrainLM
-from data_preparation.pretrain_dataset import BertPreTrainDataset
+from bert_model.bert_model import BertFinetuneCLSLM
+from data_preparation.mnli_dataset import MNLIDataset
 from bert_model.load_pretrain_model import load_pretrain_model
 from data_preparation.dataset_utils import DatasetUtils
 from torch.nn.parallel import DistributedDataParallel as DDP
+from datasets import load_dataset
+from torch.utils.data import Subset
 import torch.multiprocessing as mp
 
-class BertPreTrainer:
+class BertCLSFineTuner:
     
     def __init__(self, 
                  is_ddp: bool,
                  device: Union[int, torch.device],
-                 train_dataset: BertPreTrainDataset, 
-                 val_dataset: BertPreTrainDataset, 
-                 model: BertPretrainLM, 
+                 train_dataset: "torch.utils.data.Dataset", 
+                 val_dataset: "torch.utils.data.Dataset", 
+                 model: BertFinetuneCLSLM, 
                  optimizer: "torch.optim.Optimizer",
                  num_epochs: int,
                  batch_size: int,
                  val_frac: float,
                  checkpoint_dir: Path):
         
-        super(BertPreTrainer, self).__init__()
+        super(BertCLSFineTuner, self).__init__()
         self.is_ddp = is_ddp
         self.device = device
         self.train_ds = train_dataset
@@ -37,8 +39,8 @@ class BertPreTrainer:
         self.val_frac = val_frac
         self.checkpoint_dir = checkpoint_dir
         
-        self.train_dl = DatasetUtils.prepare_dataloader(self.train_ds, self.is_ddp, self.batch_size, is_train=True, collate_fn=DatasetUtils.collate_fn)
-        self.val_dl = DatasetUtils.prepare_dataloader(self.val_ds, self.is_ddp, self.batch_size, is_train=True, collate_fn=DatasetUtils.collate_fn)
+        self.train_dl = DatasetUtils.prepare_dataloader(self.train_ds, self.is_ddp, self.batch_size, is_train=True, collate_fn=DatasetUtils.cls_collate_fn)
+        self.val_dl = DatasetUtils.prepare_dataloader(self.val_ds, self.is_ddp, self.batch_size, is_train=True, collate_fn=DatasetUtils.cls_collate_fn)
         self.device_info = f"[GPU_{self.device} (DDP)]" if self.is_ddp else f"[{str(self.device).upper()} (SEQ)]"
         
         self.start_epoch = 0 # to keep track of resuming from checkpoint
@@ -46,113 +48,112 @@ class BertPreTrainer:
         # Lists to store metrics
         self.train_list = []
         self.val_list = []
+        
+        # Cosine anealing
+        self.initial_lr = 0.00001
+        self.peak_lr = 0.01
+        self.min_lr = 0.1 * self.initial_lr
+        self.warmup_steps = 100
+        self.total_steps = len(self.train_dl) * self.num_epochs
+        self.current_step = 0
        
-    def _forward_batch(self, batch: dict, is_train: bool) -> dict:
+    def _forward_batch(self, batch: dict, is_train: bool) -> torch.tensor:
         
         inputs = batch["input_seq_batch"].to(self.device) # (b, T)
         padding_mask = batch["pad_attn_mask_batch"].to(self.device) # (b, T)
         segment_ids = batch["segment_seq_batch"].to(self.device) # (b, T)
-        mlm_label_mask = batch["label_seq_batch"].to(self.device) # (b, T)
         
         if is_train:
             self.model.train()
-            out = self.model(inputs=inputs, segment_ids=segment_ids, padding_mask=padding_mask, mlm_label_mask=mlm_label_mask)
+            out = self.model(inputs=inputs, segment_ids=segment_ids, padding_mask=padding_mask)
         else:
             self.model.eval()
             with torch.no_grad():
-                out = self.model(inputs=inputs, segment_ids=segment_ids, padding_mask=padding_mask, mlm_label_mask=mlm_label_mask)
+                out = self.model(inputs=inputs, segment_ids=segment_ids, padding_mask=padding_mask)
   
-        return out
+        return out # (b, c)
     
-    def _calc_loss_batch(self, pred_outputs: dict, true_outputs: dict) -> Tuple[torch.tensor, dict]:
+    def _calc_loss_batch(self, pred_outputs: torch.tensor, true_outputs: torch.tensor) -> torch.tensor:
         
-        pred_outputs_nsp = pred_outputs["nsp"].to(self.device)
-        pred_outputs_mlm = pred_outputs["mlm"].to(self.device)
-        true_outputs_nsp = true_outputs["nsp"].to(self.device)
-        true_outputs_mlm = true_outputs["mlm"].to(self.device)
-        
-        assert pred_outputs_nsp.dim() == 2, f"pred_outputs['nsp'].shape = {pred_outputs_nsp.shape} must be (b, 2)"
-        assert true_outputs_nsp.dim() == 1, f"true_outputs['nsp'].shape = {true_outputs_nsp.shape} must be (b,)"
-        assert pred_outputs_mlm.dim() == 2, f"pred_outputs['mlm'].shape = {pred_outputs_mlm.shape} must be (bm, V)"
-        assert true_outputs_mlm.dim() == 1, f"true_outputs['mlm'].shape = {true_outputs_mlm.shape} must be (bm,)"
+        pred_outputs = pred_outputs.to(self.device)
+        true_outputs = true_outputs.to(self.device)
+
+        assert pred_outputs.dim() == 2, f"pred_outputs.shape = {pred_outputs.shape} must be (b, c)"
+        assert true_outputs.dim() == 1, f"true_outputs.shape = {true_outputs.shape} must be (b,)"
     
-        loss_nsp = torch.nn.functional.cross_entropy(input=pred_outputs_nsp, target=true_outputs_nsp)
-        loss_mlm = torch.nn.functional.cross_entropy(input=pred_outputs_mlm, target=true_outputs_mlm)
-        loss = loss_nsp + loss_mlm
+        loss = torch.nn.functional.cross_entropy(input=pred_outputs, target=true_outputs)
         
-        return loss, {"loss_nsp": loss_nsp.item(), "loss_mlm": loss_mlm.item()} # returns the computational graph also along with it
+        return loss # returns the computational graph also along with it
         
-    def _calc_acc_batch(self, pred_outputs: dict, true_outputs: dict) -> dict:
+    def _calc_acc_batch(self, pred_outputs: torch.tensor, true_outputs: torch.tensor) -> torch.tensor:
         
-        pred_outputs_nsp = pred_outputs["nsp"].to(self.device)
-        pred_outputs_mlm = pred_outputs["mlm"].to(self.device)
-        true_outputs_nsp = true_outputs["nsp"].to(self.device)
-        true_outputs_mlm = true_outputs["mlm"].to(self.device)
-        
-        assert pred_outputs_nsp.dim() == 2, f"pred_outputs['nsp'].shape = {pred_outputs_nsp.shape} must be (b, 2)"
-        assert true_outputs_nsp.dim() == 1, f"true_outputs['nsp'].shape = {true_outputs_nsp.shape} must be (b,)"
-        assert pred_outputs_mlm.dim() == 2, f"pred_outputs['mlm'].shape = {pred_outputs_mlm.shape} must be (bm, V)"
-        assert true_outputs_mlm.dim() == 1, f"true_outputs['mlm'].shape = {true_outputs_mlm.shape} must be (bm,)"
+        pred_outputs = pred_outputs.to(self.device)
+        true_outputs = true_outputs.to(self.device)
+
+        assert pred_outputs.dim() == 2, f"pred_outputs.shape = {pred_outputs.shape} must be (b, c)"
+        assert true_outputs.dim() == 1, f"true_outputs.shape = {true_outputs.shape} must be (b,)"
     
-        acc_nsp = (pred_outputs_nsp.argmax(dim=-1) == true_outputs_nsp).to(torch.float32).mean()
-        acc_mlm = (pred_outputs_mlm.argmax(dim=-1) == true_outputs_mlm).to(torch.float32).mean()
-        acc = {"acc_nsp": acc_nsp.item(), "acc_mlm": acc_mlm.item()}
+        acc = (pred_outputs.argmax(dim=-1) == true_outputs).to(torch.float32).mean()
         
-        return acc # returns the scalar number
+        return torch.tensor(acc.item()) # returns the tensor as a scalar number
     
-    def _optimize_batch(self, batch: dict) -> Tuple[dict, dict]:
+    def _optimize_batch(self, batch: dict) -> Tuple[float, float]:
         
-        pred_out = self._forward_batch(batch=batch, is_train=True) # dict.keys() = ["mlm", "nsp"]
-        mlm_true_out = batch["label_seq_batch"]
-        mlm_true_out = mlm_true_out[mlm_true_out != 0]
-        true_out = {"nsp": batch["is_next_batch"], "mlm": mlm_true_out}
+        if self.current_step < self.warmup_steps:
+            lr = self.initial_lr + self.current_step * (self.peak_lr - self.initial_lr) / self.warmup_steps
+        else:
+            progress = (self.current_step - self.warmup_steps) / (self.total_steps - self.warmup_steps)
+            lr = self.min_lr + 0.5 * (self.peak_lr - self.min_lr) * (1 + math.cos(math.pi * progress))
+
+        for i in range(len(self.optimizer.param_groups)):
+            self.optimizer.param_groups[i]["lr"] = lr        
+        
+        pred_out = self._forward_batch(batch=batch, is_train=True) # (b, c)
+        true_out = batch["label_batch"] # (b,)
         
         self.optimizer.zero_grad(set_to_none=True)
-        loss, loss_dict = self._calc_loss_batch(pred_outputs=pred_out, true_outputs=true_out)
-        acc_dict = self._calc_acc_batch(pred_outputs=pred_out, true_outputs=true_out)
-        loss.backward()
-        self.optimizer.step()
         
-        return loss_dict, acc_dict
+        loss = self._calc_loss_batch(pred_outputs=pred_out, true_outputs=true_out)
+        acc = self._calc_acc_batch(pred_outputs=pred_out, true_outputs=true_out)
+        loss.backward()
+                
+        if self.current_step > self.warmup_steps:
+            torch.nn.utils.clip_grad_norm_(parameters=self.model.parameters(), max_norm=1.0, norm_type=2.0)
+                    
+        self.optimizer.step()
+        self.current_step += 1
+        
+        return loss.item(), acc.item()
     
     def _optimize_dataloader(self, ep: int) -> dict:
         
         num_steps = len(self.train_dl)
-        loss_m_list = []
-        loss_n_list = []
-        acc_m_list = []
-        acc_n_list = []
+        loss_list = []
+        acc_list = []
         
         with tqdm.tqdm(iterable=self.train_dl, 
-                  desc=f"{self.device_info}, ep: {ep}/{self.num_epochs-1}", 
-                  total=num_steps,
-                  unit=" step") as pbar:
+            desc=f"{self.device_info}, ep: {ep}/{self.num_epochs-1}", 
+            total=num_steps,
+            unit=" step") as pbar:
         
             for batch in pbar:
-                loss_dict, acc_dict = self._optimize_batch(batch=batch)
-                loss_m_list.append(loss_dict["loss_mlm"])
-                loss_n_list.append(loss_dict["loss_nsp"])
-                acc_m_list.append(acc_dict["acc_mlm"])
-                acc_n_list.append(acc_dict["acc_nsp"])
+                                
+                loss, acc = self._optimize_batch(batch=batch)
+                loss_list.append(loss)
+                acc_list.append(acc)
                 
-                pbar.set_postfix({"Ln": f"{loss_dict['loss_nsp']:.3f}",
-                                  "Lm": f"{loss_dict['loss_mlm']:.3f}",
-                                  "An": f"{acc_dict['acc_nsp']:.3f}",
-                                  "Am": f"{acc_dict['acc_mlm']:.3f}"})
+                pbar.set_postfix({"loss": f"{loss:.3f}",
+                                  "acc": f"{acc:.3f}"})
         
-        loss_m_dl = sum(loss_m_list)/len(loss_m_list)
-        loss_n_dl = sum(loss_n_list)/len(loss_n_list)
-        acc_m_dl = sum(acc_m_list)/len(acc_m_list)
-        acc_n_dl = sum(acc_n_list)/len(acc_n_list)
+        loss_dl = sum(loss_list)/len(loss_list)
+        acc_dl = sum(acc_list)/len(acc_list)
             
-        return {"loss_mlm_dl": loss_m_dl, "loss_nsp_dl": loss_n_dl, "acc_mlm_dl": acc_m_dl, "acc_nsp_dl": acc_n_dl}
+        return {"loss_dl": f"{loss_dl:.3f}", "acc_dl": f"{acc_dl:.3f}"}
 
     def _validate_dataloader(self, ep: int) -> dict:
         
-        loss_m_list = []
-        loss_n_list = []
-        acc_m_list = []
-        acc_n_list = []
+        loss_list = []
+        acc_list = []
         
         with tqdm.tqdm(iterable=self.val_dl, 
                   desc=f"{self.device_info}, ep: {ep}/{self.num_epochs-1}", 
@@ -161,29 +162,21 @@ class BertPreTrainer:
         
             for batch in pbar:  
                 pred_out = self._forward_batch(batch=batch, is_train=False)
-                mlm_true_out = batch["label_seq_batch"]
-                mlm_true_out = mlm_true_out[mlm_true_out != 0]
-                true_out = {"nsp": batch["is_next_batch"], "mlm": mlm_true_out}
+                true_out = batch["label_batch"]
                 
-                loss_dict = self._calc_loss_batch(pred_outputs=pred_out, true_outputs=true_out)[-1]
-                acc_dict = self._calc_acc_batch(pred_outputs=pred_out, true_outputs=true_out)
+                loss = self._calc_loss_batch(pred_outputs=pred_out, true_outputs=true_out)
+                acc = self._calc_acc_batch(pred_outputs=pred_out, true_outputs=true_out)
                 
-                loss_m_list.append(loss_dict["loss_mlm"])
-                loss_n_list.append(loss_dict["loss_nsp"])
-                acc_m_list.append(acc_dict["acc_mlm"])
-                acc_n_list.append(acc_dict["acc_nsp"])
+                loss_list.append(loss.item())
+                acc_list.append(acc.item())
                 
-                pbar.set_postfix({"Ln_v": f"{loss_dict['loss_nsp']:.3f}",
-                                  "Lm_v": f"{loss_dict['loss_mlm']:.3f}",
-                                  "An_v": f"{acc_dict['acc_nsp']:.3f}",
-                                  "Am_v": f"{acc_dict['acc_mlm']:.3f}"})
+                pbar.set_postfix({"loss_val": f"{loss:.3f}",
+                                  "acc_val": f"{acc:.3f}"})
                 
-        loss_m_dl = sum(loss_m_list)/len(loss_m_list)
-        loss_n_dl = sum(loss_n_list)/len(loss_n_list)
-        acc_m_dl = sum(acc_m_list)/len(acc_m_list)
-        acc_n_dl = sum(acc_n_list)/len(acc_n_list)
+        loss_dl = sum(loss_list)/len(loss_list)
+        acc_dl = sum(acc_list)/len(acc_list)
             
-        return {"loss_mlm_dl": loss_m_dl, "loss_nsp_dl": loss_n_dl, "acc_mlm_dl": acc_m_dl, "acc_nsp_dl": acc_n_dl}
+        return {"loss_dl": f"{loss_dl:.3f}", "acc_dl": f"{acc_dl:.3f}"}
 
     def _save_checkpoint(self, ep: int) -> None:
         
@@ -265,7 +258,7 @@ class BertPreTrainer:
 
         save_dir.mkdir(parents=True, exist_ok=True)
         save_path = Path(save_dir, 'training_validation_metrics.json')
-        json.dump(history, open(save_path, "w"))
+        json.dump(history, open(save_path, "w"), indent=4)
         
         print(f"{self.device_info}, ep: {ep}/{self.num_epochs-1}, Train and validation metrics saved at: {save_path}")
 
@@ -287,11 +280,11 @@ class BertPreTrainer:
         
         if is_load_checkpoint:
             self._load_checkpoint(checkpoint_dir=self.checkpoint_dir)
-        
+            
         for ep in range(self.start_epoch, self.num_epochs):
             if self.is_ddp:
                 self.train_dl.sampler.set_epoch(ep)
-                
+            
             train_dict = self._optimize_dataloader(ep=ep)
             self.train_list.append(train_dict)
             
@@ -334,27 +327,27 @@ def main(rank: int, is_ddp: bool, world_size: int, num_epochs: int, batch_size: 
         "num_layers": 12
     }
 
-    model = BertPretrainLM(config=config, tokenizer=tokenizer)
+    model = BertFinetuneCLSLM(config=config, tokenizer=tokenizer, num_classes=3)
     torchinfo.summary(model)
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    source_model = BertModel.from_pretrained("bert-base-cased")
+    load_pretrain_model(source_model=source_model, target_model=model.bert)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0)
     
-    data_dir = Path(Path.cwd(), "data/pre_training/gutenberg/clean")
-    train_files_list, val_files_list = DatasetUtils.train_val_split(data_dir=data_dir, split_ratio=0.8)
-
-    train_ds = BertPreTrainDataset(text_files_list=train_files_list, tokenizer=tokenizer, max_context_legth=512, is_train=True)
-    val_ds = BertPreTrainDataset(text_files_list=val_files_list, tokenizer=tokenizer, max_context_legth=512, is_train=False)
-    
-    trainer = BertPreTrainer(is_ddp=is_ddp,
-                             device=device,
-                             train_dataset=train_ds,
-                             val_dataset=val_ds,
-                             model=model,
-                             optimizer=optimizer,
-                             num_epochs=num_epochs,
-                             batch_size=batch_size,
-                             val_frac=0.2,
-                             checkpoint_dir=Path(Path.cwd(), "ckpt"))
+    hf_ds = load_dataset("nyu-mll/multi_nli")
+    train_ds = MNLIDataset(hf_dataset=hf_ds, tokenizer=tokenizer, is_train=True, frac=1.0)
+    val_ds = MNLIDataset(hf_dataset=hf_ds, tokenizer=tokenizer, is_train=False, frac=1.0)
+        
+    trainer = BertCLSFineTuner(is_ddp=is_ddp,
+                               device=device,
+                               train_dataset=train_ds,
+                               val_dataset=val_ds,
+                               model=model,
+                               optimizer=optimizer,
+                               num_epochs=num_epochs,
+                               batch_size=batch_size,
+                               val_frac=0.2,
+                               checkpoint_dir=Path(Path.cwd(), "ckpt"))
     
     trainer.train(is_load_checkpoint=is_load_checkpoint)
     

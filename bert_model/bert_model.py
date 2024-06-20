@@ -193,18 +193,19 @@ class Bert(torch.nn.Module):
         
         return {"hidden_states": x, "pooled_output": z} # hidden and pooled output
 
-class BertNSP(torch.nn.Module):
+class BertCLS(torch.nn.Module):
     
-    def __init__(self, embedding_dim: int):
-        super(BertNSP, self).__init__()
+    def __init__(self, embedding_dim: int, num_classes: int):
+        super(BertCLS, self).__init__()
         self.d = embedding_dim
+        self.c = num_classes
         
-        self.linear = torch.nn.Linear(in_features=self.d, out_features=2, bias=True)
+        self.linear = torch.nn.Linear(in_features=self.d, out_features=self.c, bias=True)
     
     def forward(self, inputs: torch.tensor) -> torch.tensor:
         
         assert inputs.shape[-1] == self.d and inputs.dim() == 2, f"inputs shape {inputs.shape} must be (b, {self.d})"
-        x = self.linear(inputs) # (b, 2)
+        x = self.linear(inputs) # (b, c)
         
         return x # no need for softmax as loss function expects the logits and not probabilities
 
@@ -234,11 +235,11 @@ class BertPretrainLM(torch.nn.Module):
         self.tokenizer = tokenizer
         
         self.bert = Bert(config=self.config)
-        self.nsp_head = BertNSP(embedding_dim=self.d)
+        self.nsp_head = BertCLS(embedding_dim=self.d, num_classes=2)
         self.mlm_head = BertMLM(embedding_dim=self.d, vocab_size=self.V)
         
     def forward(self, inputs: torch.tensor, segment_ids: torch.tensor, padding_mask: torch.tensor, mlm_label_mask: torch.tensor) -> dict:
-        """inputs.shape = segment_ids.shape = padding_mask.shape = token_mask.shape = mlm_label_mask.shape = (b, T)
+        """inputs.shape = segment_ids.shape = padding_mask.shape = mlm_label_mask.shape = (b, T)
         segment_ids = 0 means sentence A and padding position and 1 means sentence B
         padding_mask = 0 means it is padded token and 1 means it is real token
         mlm_label_mask = 0 means it is masked and non zero means output should be reported
@@ -248,7 +249,7 @@ class BertPretrainLM(torch.nn.Module):
         pooled_out = x["pooled_output"]
         hidden_states = x["hidden_states"]
         
-        z1 = self.nsp_head(inputs=pooled_out) # (b, 2)
+        z1 = self.nsp_head(inputs=pooled_out) # (b, c)
         z2 = self.mlm_head(inputs=hidden_states) # (b, T, V)
         
         mlm_label_mask = (mlm_label_mask != 0).to(inputs.device) # (b, T) 
@@ -258,7 +259,32 @@ class BertPretrainLM(torch.nn.Module):
         assert z3.shape[0] == mlm_token_count, f"Bert outputs {z3.shape[0]} tokens but actual {mlm_token_count} tokens are used for MLM"
         
         return {"nsp": z1, "mlm": z3}
+
+class BertFinetuneCLSLM(torch.nn.Module):
+    
+    def __init__(self, config: dict, tokenizer: "BertTokenizer", num_classes: int):
+        super(BertFinetuneCLSLM, self).__init__()
+        self.config = config
+        self.d = self.config["embedding_dim"]
+        self.V = self.config["vocab_size"]
+        self.tokenizer = tokenizer
+        self.c = num_classes
         
+        self.bert = Bert(config=self.config)
+        self.cls_head = BertCLS(embedding_dim=self.d, num_classes=self.c)
+        
+    def forward(self, inputs: torch.tensor, segment_ids: torch.tensor, padding_mask: torch.tensor) -> torch.tensor:
+        """inputs.shape = segment_ids.shape = padding_mask.shape = (b, T)
+        segment_ids = 0 means sentence A and padding position and 1 means sentence B
+        padding_mask = 0 means it is padded token and 1 means it is real token
+        """
+        
+        x = self.bert(inputs=inputs, segment_ids=segment_ids, padding_mask=padding_mask)
+        pooled_out = x["pooled_output"]
+        z1 = self.cls_head(inputs=pooled_out) # (b, c)
+        
+        return z1
+       
 def main():
     
     tokenizer = BertTokenizer.from_pretrained("bert-base-cased")
