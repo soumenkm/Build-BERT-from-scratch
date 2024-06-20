@@ -5,7 +5,7 @@ from typing import List, Tuple, Union
 from transformers import BertModel, BertTokenizer
 from bert_model.bert_model import BertFinetuneCLSLM
 from data_preparation.mnli_dataset import MNLIDataset
-from bert_model.load_pretrain_model import load_pretrain_model
+from bert_model.load_pretrain_model import load_pretrain_model, compare_model_output
 from data_preparation.dataset_utils import DatasetUtils
 from torch.nn.parallel import DistributedDataParallel as DDP
 from datasets import load_dataset
@@ -50,10 +50,10 @@ class BertCLSFineTuner:
         self.val_list = []
         
         # Cosine anealing
-        self.initial_lr = 0.00001
-        self.peak_lr = 0.01
+        self.initial_lr = 1e-4
+        self.peak_lr = 1e-3
         self.min_lr = 0.1 * self.initial_lr
-        self.warmup_steps = 100
+        self.warmup_steps = 200
         self.total_steps = len(self.train_dl) * self.num_epochs
         self.current_step = 0
        
@@ -66,6 +66,8 @@ class BertCLSFineTuner:
         if is_train:
             self.model.train()
             out = self.model(inputs=inputs, segment_ids=segment_ids, padding_mask=padding_mask)
+            out.requires_grad_(True)
+            assert out.requires_grad == True
         else:
             self.model.eval()
             with torch.no_grad():
@@ -139,11 +141,13 @@ class BertCLSFineTuner:
             for batch in pbar:
                                 
                 loss, acc = self._optimize_batch(batch=batch)
+
                 loss_list.append(loss)
                 acc_list.append(acc)
                 
                 pbar.set_postfix({"loss": f"{loss:.3f}",
-                                  "acc": f"{acc:.3f}"})
+                                  "acc": f"{acc:.3f}",
+                                "lr": f"{self.optimizer.param_groups[0]["lr"]}"})
         
         loss_dl = sum(loss_list)/len(loss_list)
         acc_dl = sum(acc_list)/len(acc_list)
@@ -276,11 +280,27 @@ class BertCLSFineTuner:
         # if self.is_ddp:
         #     torch.distributed.barrier()
 
-    def train(self, is_load_checkpoint: bool) -> None:
+    def _unfreeze_layers(self, layers_list: List[str]) -> None:
+        """['cls_head', 'bert.pooler', 'bert.encoder.transformer_blocks.11', 'bert.embedding']"""
+        
+        for val in self.model.parameters():
+            val.requires_grad_(False)
+        
+        for name, val in self.model.named_parameters():
+            for layer in layers_list:
+                if name.startswith(layer):
+                    val.requires_grad_(True)
+                    break
+        
+        print(f"Gradients are computed for: ", [name for name, val in self.model.named_parameters() if val.requires_grad])
+        
+    def finetune(self, is_load_checkpoint: bool, layers_list: List[str]) -> None:
         
         if is_load_checkpoint:
             self._load_checkpoint(checkpoint_dir=self.checkpoint_dir)
-            
+        
+        self._unfreeze_layers(layers_list=layers_list)
+        
         for ep in range(self.start_epoch, self.num_epochs):
             if self.is_ddp:
                 self.train_dl.sampler.set_epoch(ep)
@@ -288,12 +308,16 @@ class BertCLSFineTuner:
             train_dict = self._optimize_dataloader(ep=ep)
             self.train_list.append(train_dict)
             
+            for name, param in self.model.named_parameters():
+                if param.requires_grad:
+                    print(f"Ep: {ep}, {name} - grad: {param.grad.abs().mean()}")
+                    
             if self.is_ddp: 
                 if (self.device == 0):
                     self._postprocess_train(ep=ep, train_dict=train_dict)
             else:
                 self._postprocess_train(ep=ep, train_dict=train_dict)
-
+                
 def ddp_setup(world_size: int, rank: int) -> None:
     
     os.environ["MASTER_ADDR"] = "localhost"
@@ -317,12 +341,12 @@ def main(rank: int, is_ddp: bool, world_size: int, num_epochs: int, batch_size: 
     else:
         device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
-    tokenizer = BertTokenizer.from_pretrained("bert-base-cased")
+    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
     config = {
         "vocab_size": tokenizer.vocab_size,
         "embedding_dim": 768,
         "num_heads": 12,
-        "dropout_prob": 0.2,
+        "dropout_prob": 0.1,
         "max_context_length": 512,
         "num_layers": 12
     }
@@ -330,13 +354,13 @@ def main(rank: int, is_ddp: bool, world_size: int, num_epochs: int, batch_size: 
     model = BertFinetuneCLSLM(config=config, tokenizer=tokenizer, num_classes=3)
     torchinfo.summary(model)
     
-    source_model = BertModel.from_pretrained("bert-base-cased")
+    source_model = BertModel.from_pretrained("bert-base-uncased")
     load_pretrain_model(source_model=source_model, target_model=model.bert)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0, weight_decay=1e-4)
     
     hf_ds = load_dataset("nyu-mll/multi_nli")
-    train_ds = MNLIDataset(hf_dataset=hf_ds, tokenizer=tokenizer, is_train=True, frac=1.0)
-    val_ds = MNLIDataset(hf_dataset=hf_ds, tokenizer=tokenizer, is_train=False, frac=1.0)
+    train_ds = MNLIDataset(hf_dataset=hf_ds, tokenizer=tokenizer, is_train=True, frac=0.1)
+    val_ds = MNLIDataset(hf_dataset=hf_ds, tokenizer=tokenizer, is_train=False, frac=0.1)
         
     trainer = BertCLSFineTuner(is_ddp=is_ddp,
                                device=device,
@@ -349,13 +373,13 @@ def main(rank: int, is_ddp: bool, world_size: int, num_epochs: int, batch_size: 
                                val_frac=0.2,
                                checkpoint_dir=Path(Path.cwd(), "ckpt"))
     
-    trainer.train(is_load_checkpoint=is_load_checkpoint)
+    trainer.finetune(is_load_checkpoint=is_load_checkpoint, layers_list=["cls_head"])
     
     if is_ddp:
         ddp_cleanup()
         
 if __name__ == "__main__":
-    cuda_ids = [1,2,6]
+    cuda_ids = [1]
     cvd = ""
     for i in cuda_ids:
         cvd += str(i) + ","

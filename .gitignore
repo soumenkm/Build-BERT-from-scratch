@@ -9,3 +9,4 @@ fine_tuning/datasets
 fine_tuning/model_ckpt
 fine_tuning/outputs
 ckpt
+*.out

@@ -98,13 +98,20 @@ def load_pretrain_model(source_model: "BertModel", target_model: "Bert") -> None
     
 def compare_model_output(source_model: "BertModel", target_model: "Bert") -> None:
     
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+    
+    source_model = source_model.to(device=device)
+    target_model = target_model.to(device=device)
     source_model.eval()
     target_model.eval()
     
     with torch.no_grad():
-        inputs = torch.randint(low=0, high=target_model.V, size=(2, 10))
+        inputs = torch.randint(low=0, high=target_model.V, size=(2, 10)).to(device)
         src_out = source_model(inputs)[-1] # pooled output
-        tgt_out = target_model(inputs)[-1] # pooled output
+        tgt_out = target_model(inputs)["pooled_output"] # pooled output
         print("Output at [CLS] from source model: \n", src_out)
         print("Output at [CLS] from target model: \n", tgt_out)
 

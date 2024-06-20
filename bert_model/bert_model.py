@@ -30,6 +30,7 @@ class BertEmbedding(torch.nn.Module):
         assert segment_ids.unique().sum() in [0, 1], f"segment ids = {segment_ids.unique()} should be of only 0 or 1"
 
         x1 = self.word_embedding(inputs) # (b, T, d)
+        self.pos_inputs = self.pos_inputs.to(inputs.device)
         x2 = self.pos_embedding(self.pos_inputs[:, :inputs.shape[-1]].expand(*inputs.shape)) # (1, T) -> (b, T) -> (b, T, d) 
         x3 = self.seg_embedding(segment_ids) # (b, T, d)
         x = x1 + x2 + x3 # (b, T, d)
@@ -186,9 +187,9 @@ class Bert(torch.nn.Module):
             
         elif segment_ids is not None and padding_mask is None:
             padding_mask = torch.ones(size=inputs.shape) # all real
-            
-        x = self.embedding(inputs, segment_ids) # (b, T, d)
-        x = self.encoder(x, padding_mask) # (b, T, d)
+        
+        x = self.embedding(inputs, segment_ids.to(inputs.device)) # (b, T, d)
+        x = self.encoder(x, padding_mask.to(inputs.device)) # (b, T, d)
         z = self.pooler(x) # (b, d) only for [CLS] token
         
         return {"hidden_states": x, "pooled_output": z} # hidden and pooled output
