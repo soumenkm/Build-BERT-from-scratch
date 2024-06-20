@@ -4,8 +4,9 @@ sys.path.append(Path(__file__).parent.parent.__str__())
 from typing import List, Tuple, Union
 from transformers import BertModel, BertTokenizer
 from bert_model.bert_model import BertPretrainLM
-from data_preparation.dataset import BertPreTrainDataset
+from data_preparation.pretrain_dataset import BertPreTrainDataset
 from bert_model.load_pretrain_model import load_pretrain_model
+from data_preparation.dataset_utils import DatasetUtils
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.multiprocessing as mp
 
@@ -36,8 +37,8 @@ class BertPreTrainer:
         self.val_frac = val_frac
         self.checkpoint_dir = checkpoint_dir
         
-        self.train_dl = self._create_dataloader(is_train=True)
-        self.val_dl = self._create_dataloader(is_train=False)
+        self.train_dl = DatasetUtils.prepare_dataloader(self.train_ds, self.is_ddp, self.batch_size, is_train=True)
+        self.val_dl = DatasetUtils.prepare_dataloader(self.val_ds, self.is_ddp, self.batch_size, is_train=True)
         self.device_info = f"[GPU_{self.device} (DDP)]" if self.is_ddp else f"[{str(self.device).upper()} (SEQ)]"
         
         self.start_epoch = 0 # to keep track of resuming from checkpoint
@@ -45,22 +46,6 @@ class BertPreTrainer:
         # Lists to store metrics
         self.train_list = []
         self.val_list = []
-    
-    def _create_dataloader(self, is_train: bool) -> "torch.utils.data.DataLoader":
-        
-        if is_train:
-            if self.is_ddp:
-                sampler = torch.utils.data.distributed.DistributedSampler(dataset=self.train_ds, shuffle=True, drop_last=True)
-                train_dl = torch.utils.data.DataLoader(self.train_ds, batch_size=self.batch_size, num_workers=4, shuffle=False, collate_fn=self.train_ds.collate_fn, sampler=sampler)
-            else:
-                train_dl = torch.utils.data.DataLoader(self.train_ds, batch_size=self.batch_size, num_workers=4, shuffle=True, collate_fn=self.train_ds.collate_fn, drop_last=True)
-        else:
-            len_val_ds = len(self.val_ds)
-            indices = torch.randperm(n=len_val_ds)[:int(len_val_ds * self.val_frac)]
-            val_ds = torch.utils.data.Subset(dataset=self.val_ds, indices=indices)
-            val_dl = torch.utils.data.DataLoader(val_ds, batch_size=self.batch_size, num_workers=4, shuffle=False, collate_fn=self.val_ds.collate_fn, drop_last=True)
-
-        return train_dl if is_train else val_dl
        
     def _forward_batch(self, batch: dict, is_train: bool) -> dict:
         
@@ -267,6 +252,10 @@ class BertPreTrainer:
         else:
             self._postprocess_load_checkpoint(latest_checkpoint)
         
+        # Synchronize all processes to ensure checkpoint loading is complete
+        if self.is_ddp:
+            torch.distributed.barrier()
+        
         return None
     
     def _save_metric(self, ep: int, save_dir: Path) -> None:
@@ -289,15 +278,15 @@ class BertPreTrainer:
         print(f"{self.device_info}, {msg}")
         self._save_checkpoint(ep=ep)
         self._save_metric(ep=ep, save_dir=self.checkpoint_dir)
+        
+        # Synchronize all processes to ensure checkpoint saving is complete
+        if self.is_ddp:
+            torch.distributed.barrier()
 
     def train(self, is_load_checkpoint: bool) -> None:
         
         if is_load_checkpoint:
             self._load_checkpoint(checkpoint_dir=self.checkpoint_dir)
-            
-        # Synchronize all processes to ensure checkpoint loading is complete
-        if self.is_ddp:
-            torch.distributed.barrier()
         
         for ep in range(self.start_epoch, self.num_epochs):
             if self.is_ddp:
@@ -311,10 +300,6 @@ class BertPreTrainer:
                     self._postprocess_train(ep=ep, train_dict=train_dict)
             else:
                 self._postprocess_train(ep=ep, train_dict=train_dict)
-            
-            # Synchronize all processes to ensure checkpoint saving is complete
-            if self.is_ddp:
-                torch.distributed.barrier()
 
 def ddp_setup(world_size: int, rank: int) -> None:
     
@@ -355,7 +340,7 @@ def main(rank: int, is_ddp: bool, world_size: int, num_epochs: int, batch_size: 
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
     
     data_dir = Path(Path.cwd(), "data/pre_training/gutenberg/clean")
-    train_files_list, val_files_list = BertPreTrainDataset.train_val_split(data_dir=data_dir, split_ratio=0.8)
+    train_files_list, val_files_list = DatasetUtils.train_val_split(data_dir=data_dir, split_ratio=0.8)
 
     train_ds = BertPreTrainDataset(text_files_list=train_files_list, tokenizer=tokenizer, max_context_legth=512, is_train=True)
     val_ds = BertPreTrainDataset(text_files_list=val_files_list, tokenizer=tokenizer, max_context_legth=512, is_train=False)
@@ -377,13 +362,13 @@ def main(rank: int, is_ddp: bool, world_size: int, num_epochs: int, batch_size: 
         ddp_cleanup()
         
 if __name__ == "__main__":
-    cuda_ids = [0,1,2,3,4,5,6,7]
+    cuda_ids = [1,2,6]
     cvd = ""
     for i in cuda_ids:
         cvd += str(i) + ","
         
     os.environ["CUDA_VISIBLE_DEVICES"] = cvd
-    num_epochs = 2
+    num_epochs = 5
     batch_size = 32
     is_load_checkpoint = True
     is_ddp = True if len(cuda_ids) > 1 else False

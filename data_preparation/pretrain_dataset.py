@@ -226,78 +226,21 @@ class BertPreTrainDataset(torch.utils.data.Dataset):
               f" and this constitutes {num_discarded_sents/(num_discarded_sents+num_sents)*100:.2f}% of total sentences of {num_sents}")
 
         return sent_tuple_list
-    
-    @staticmethod
-    def collate_fn(example_list: List[dict]) -> dict:
-        """examples_list[i] = dataset.__getitem__(i)"""
-
-        input_sequence_batch = []
-        label_sequence_batch = []
-        is_next_batch = []
-        pad_attention_mask_batch = []
-        segment_id_batch = []
-        
-        for elem in example_list:
-            input_sequence_batch.append(elem["input_seq"])
-            label_sequence_batch.append(elem["label_seq"])
-            is_next_batch.append(elem["is_next"])
-            pad_attention_mask_batch.append(elem["pad_attn_mask"])
-            segment_id_batch.append(elem["segment_seq"])
-            
-        input_sequence_batch = torch.stack(tensors=input_sequence_batch, dim=0)
-        label_sequence_batch = torch.stack(tensors=label_sequence_batch, dim=0)
-        is_next_batch = torch.stack(tensors=is_next_batch, dim=0)
-        pad_attention_mask_batch = torch.stack(tensors=pad_attention_mask_batch, dim=0)
-        segment_id_batch = torch.stack(tensors=segment_id_batch, dim=0)
-        
-        data_dict = {
-            "input_seq_batch": input_sequence_batch, # (b, T)
-            "label_seq_batch": label_sequence_batch, # (b, T)
-            "is_next_batch": is_next_batch, # (b,)
-            "pad_attn_mask_batch": pad_attention_mask_batch, # (b, T) 
-            "segment_seq_batch": segment_id_batch # (b, T)
-        }
-        
-        return data_dict
-    
-    @staticmethod
-    def prepare_dataloader(dataset: "BertPreTrainDataset", batch_size: int, is_train: bool, val_frac: float=0.2) -> torch.utils.data.DataLoader:
-        
-        if is_train:
-            dataloader = torch.utils.data.DataLoader(dataset=dataset, batch_size=batch_size, shuffle=True, num_workers=4, drop_last=True, collate_fn=BertPreTrainDataset.collate_fn)
-        else:
-            subset_indices = random.sample(range(len(dataset)), k=int(len(dataset) * val_frac))
-            subset_dataset = torch.utils.data.Subset(dataset=dataset, indices=subset_indices)
-            dataloader = torch.utils.data.DataLoader(dataset=subset_dataset, batch_size=batch_size, shuffle=False, num_workers=4, drop_last=True, collate_fn=BertPreTrainDataset.collate_fn)
-        
-        return dataloader     
            
-    @staticmethod
-    def train_val_split(data_dir: Path, split_ratio: float) -> Tuple[List[Path], List[Path]]:
-        
-        files_list = []
-        for i in Path.iterdir(data_dir):
-            files_list.append(i)
-        
-        random.shuffle(files_list)
-        split = int(split_ratio * len(files_list))
-        
-        return files_list[0:split], files_list[split:]
-        
 def main():
     
     tokenizer = BertTokenizer.from_pretrained("bert-large-cased")
     data_dir = Path(Path.cwd(), "data/pre_training/gutenberg/clean")
-    train_files_list, val_files_list = BertPreTrainDataset.train_val_split(data_dir=data_dir, split_ratio=0.8)
+    train_files_list, val_files_list = DatasetUtils.train_val_split(data_dir=data_dir, split_ratio=0.8)
 
     train_ds = BertPreTrainDataset(text_files_list=train_files_list, tokenizer=tokenizer, max_context_legth=512, is_train=True)
     val_ds = BertPreTrainDataset(text_files_list=val_files_list, tokenizer=tokenizer, max_context_legth=512, is_train=False)
     
-    train_dl = BertPreTrainDataset.prepare_dataloader(train_ds, batch_size=32, is_train=True)
-    val_dl = BertPreTrainDataset.prepare_dataloader(val_ds, batch_size=32, is_train=True)
+    train_dl = DatasetUtils.prepare_dataloader(train_ds, is_ddp=False, batch_size=32, is_train=True)
+    val_dl = BertPreTrainDataset.prepare_dataloader(val_ds, is_ddp=False, batch_size=32, is_train=True)
     
     print(train_dl.__iter__().__next__())
     
 if __name__ == "__main__":
-    
+    from dataset_utils import DatasetUtils
     main()
