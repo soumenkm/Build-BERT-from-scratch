@@ -1,6 +1,6 @@
 import torch, torchinfo, json
 from typing import Tuple, List
-from transformers import BertTokenizer
+from transformers import BertTokenizer, BertModel
 
 class BertEmbedding(torch.nn.Module):
     
@@ -281,11 +281,32 @@ class BertFinetuneCLSLM(torch.nn.Module):
         """
         
         x = self.bert(inputs=inputs, segment_ids=segment_ids, padding_mask=padding_mask)
-        pooled_out = x["pooled_output"]
+        pooled_out = x["pooled_output"] # (b, d)
         z1 = self.cls_head(inputs=pooled_out) # (b, c)
         
         return z1
-       
+
+class BertModelFinetuneCLSLM(torch.nn.Module):
+    
+    def __init__(self, num_classes: int):
+        super(BertModelFinetuneCLSLM, self).__init__()
+        self.c = num_classes
+        self.bert = BertModel.from_pretrained("bert-base-uncased")
+        self.d = self.bert.config.hidden_size
+        self.cls_head = BertCLS(embedding_dim=self.d, num_classes=self.c)
+        
+    def forward(self, inputs: torch.tensor, segment_ids: torch.tensor, padding_mask: torch.tensor) -> torch.tensor:
+        """inputs.shape = segment_ids.shape = padding_mask.shape = (b, T)
+        segment_ids = 0 means sentence A and padding position and 1 means sentence B
+        padding_mask = 0 means it is padded token and 1 means it is real token
+        """
+        
+        x = self.bert(input_ids=inputs, token_type_ids=segment_ids, attention_mask=padding_mask)
+        pooled_out = x.pooler_output # (b, d)
+        z1 = self.cls_head(inputs=pooled_out) # (b, c)
+        
+        return z1
+
 def main():
     
     tokenizer = BertTokenizer.from_pretrained("bert-base-cased")

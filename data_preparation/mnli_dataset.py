@@ -39,6 +39,7 @@ class MNLIDataset(Dataset):
         segment_ids = [0] * len(sent_A_token_ids) + [1] * len(sent_B_token_ids)
         
         example = {
+            "string_seq": (sent_A, sent_B),
             "input_seq": sequence,
             "label": int(label),
             "length": len(sequence),

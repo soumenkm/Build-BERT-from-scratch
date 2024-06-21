@@ -96,7 +96,10 @@ def load_pretrain_model(source_model: "BertModel", target_model: "Bert") -> None
     tgt_psum = sum([i.sum().detach().numpy() for i in target_model.parameters()])
     assert abs(src_psum - tgt_psum) < 1, f"Sum of parameters (source={src_psum}, target={tgt_psum}) do not match"
     
-def compare_model_output(source_model: "BertModel", target_model: "Bert") -> None:
+def compare_model_output(source_model: "BertModel", target_model: "Bert", inputs_ids: torch.tensor, segment_ids: torch.tensor, padding_mask: torch.tensor) -> None:
+    """inputs.shape = (b, T), segment_ids.shape = (b, T), padding_mask.shape = (b, T)
+        padding_mask = 0 means it is padded token and 1 means it is real token
+    """
     
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -109,11 +112,14 @@ def compare_model_output(source_model: "BertModel", target_model: "Bert") -> Non
     target_model.eval()
     
     with torch.no_grad():
-        inputs = torch.randint(low=0, high=target_model.V, size=(2, 10)).to(device)
-        src_out = source_model(inputs)[-1] # pooled output
-        tgt_out = target_model(inputs)["pooled_output"] # pooled output
-        print("Output at [CLS] from source model: \n", src_out)
-        print("Output at [CLS] from target model: \n", tgt_out)
+        inputs_ids = inputs_ids.to(device)
+        segment_ids = segment_ids.to(device)
+        padding_mask = padding_mask.to(device)
+        
+        src_out = source_model(input_ids=inputs_ids, token_type_ids=segment_ids, attention_mask=padding_mask).pooler_output
+        tgt_out = target_model(inputs=inputs_ids, segment_ids=segment_ids, padding_mask=padding_mask)["pooled_output"] # pooled output
+        print("Output at [CLS] from source model: ", src_out.sum().item())
+        print("Output at [CLS] from target model: ", tgt_out.sum().item())
 
 def main():
     tokenizer = BertTokenizer.from_pretrained("bert-base-cased")

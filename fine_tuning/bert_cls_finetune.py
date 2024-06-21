@@ -24,20 +24,22 @@ class BertCLSFineTuner:
                  num_epochs: int,
                  batch_size: int,
                  val_frac: float,
-                 checkpoint_dir: Path):
+                 checkpoint_dir: Path,
+                 source_model: BertModel = None):
         
         super(BertCLSFineTuner, self).__init__()
         self.is_ddp = is_ddp
         self.device = device
         self.train_ds = train_dataset
         self.val_ds = val_dataset
-        self.model = DDP(model.to(self.device), device_ids=[self.device]) if self.is_ddp else model.to(self.device)
+        self.model = DDP(model.to(self.device), device_ids=[self.device], find_unused_parameters=True) if self.is_ddp else model.to(self.device)
         self.optimizer = optimizer
         self.tokenizer = self.train_ds.tokenizer
         self.num_epochs = num_epochs
         self.batch_size = batch_size
         self.val_frac = val_frac
         self.checkpoint_dir = checkpoint_dir
+        self.source_model = source_model.to(self.device)
         
         self.train_dl = DatasetUtils.prepare_dataloader(self.train_ds, self.is_ddp, self.batch_size, is_train=True, collate_fn=DatasetUtils.cls_collate_fn)
         self.val_dl = DatasetUtils.prepare_dataloader(self.val_ds, self.is_ddp, self.batch_size, is_train=True, collate_fn=DatasetUtils.cls_collate_fn)
@@ -49,13 +51,8 @@ class BertCLSFineTuner:
         self.train_list = []
         self.val_list = []
         
-        # Cosine anealing
-        self.initial_lr = 1e-4
-        self.peak_lr = 1e-3
-        self.min_lr = 0.1 * self.initial_lr
-        self.warmup_steps = 200
-        self.total_steps = len(self.train_dl) * self.num_epochs
-        self.current_step = 0
+        # Grad norm
+        self.clip_norm_value = 2.0
        
     def _forward_batch(self, batch: dict, is_train: bool) -> torch.tensor:
         
@@ -99,34 +96,31 @@ class BertCLSFineTuner:
         
         return torch.tensor(acc.item()) # returns the tensor as a scalar number
     
-    def _optimize_batch(self, batch: dict) -> Tuple[float, float]:
-        
-        if self.current_step < self.warmup_steps:
-            lr = self.initial_lr + self.current_step * (self.peak_lr - self.initial_lr) / self.warmup_steps
-        else:
-            progress = (self.current_step - self.warmup_steps) / (self.total_steps - self.warmup_steps)
-            lr = self.min_lr + 0.5 * (self.peak_lr - self.min_lr) * (1 + math.cos(math.pi * progress))
-
-        for i in range(len(self.optimizer.param_groups)):
-            self.optimizer.param_groups[i]["lr"] = lr        
+    def _optimize_batch(self, batch: dict) -> Tuple[float, float]:  
         
         pred_out = self._forward_batch(batch=batch, is_train=True) # (b, c)
         true_out = batch["label_batch"] # (b,)
-        
-        self.optimizer.zero_grad(set_to_none=True)
-        
+                
         loss = self._calc_loss_batch(pred_outputs=pred_out, true_outputs=true_out)
         acc = self._calc_acc_batch(pred_outputs=pred_out, true_outputs=true_out)
-        loss.backward()
-                
-        if self.current_step > self.warmup_steps:
-            torch.nn.utils.clip_grad_norm_(parameters=self.model.parameters(), max_norm=1.0, norm_type=2.0)
-                    
+        
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()        
+        torch.nn.utils.clip_grad_norm_(parameters=self.model.parameters(), max_norm=self.clip_norm_value, norm_type=2.0)
         self.optimizer.step()
-        self.current_step += 1
         
         return loss.item(), acc.item()
     
+    def _find_norm(self, is_grad: bool):
+    
+        norm = 0
+        for val in self.model.parameters():
+            if val.requires_grad:
+                norm += ((val.grad if is_grad else val) ** 2).sum().item()
+        norm = norm ** 0.5
+        
+        return norm
+
     def _optimize_dataloader(self, ep: int) -> dict:
         
         num_steps = len(self.train_dl)
@@ -145,10 +139,12 @@ class BertCLSFineTuner:
                 loss_list.append(loss)
                 acc_list.append(acc)
                 
-                pbar.set_postfix({"loss": f"{loss:.3f}",
-                                  "acc": f"{acc:.3f}",
-                                "lr": f"{self.optimizer.param_groups[0]["lr"]}"})
-        
+                pbar.set_postfix({"L": f"{loss:.3f}",
+                                  "A": f"{acc:.3f}",
+                                  "lr": f"{self.optimizer.param_groups[0]["lr"]:.3e}",
+                                  "gn": f"{self._find_norm(True):.2f}",
+                                  "pn": f"{self._find_norm(False):.4f}"})
+
         loss_dl = sum(loss_list)/len(loss_list)
         acc_dl = sum(acc_list)/len(acc_list)
             
@@ -288,7 +284,7 @@ class BertCLSFineTuner:
         
         for name, val in self.model.named_parameters():
             for layer in layers_list:
-                if name.startswith(layer):
+                if layer in name:
                     val.requires_grad_(True)
                     break
         
@@ -308,10 +304,6 @@ class BertCLSFineTuner:
             train_dict = self._optimize_dataloader(ep=ep)
             self.train_list.append(train_dict)
             
-            for name, param in self.model.named_parameters():
-                if param.requires_grad:
-                    print(f"Ep: {ep}, {name} - grad: {param.grad.abs().mean()}")
-                    
             if self.is_ddp: 
                 if (self.device == 0):
                     self._postprocess_train(ep=ep, train_dict=train_dict)
@@ -356,11 +348,11 @@ def main(rank: int, is_ddp: bool, world_size: int, num_epochs: int, batch_size: 
     
     source_model = BertModel.from_pretrained("bert-base-uncased")
     load_pretrain_model(source_model=source_model, target_model=model.bert)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5, weight_decay=0.1)
     
     hf_ds = load_dataset("nyu-mll/multi_nli")
-    train_ds = MNLIDataset(hf_dataset=hf_ds, tokenizer=tokenizer, is_train=True, frac=0.1)
-    val_ds = MNLIDataset(hf_dataset=hf_ds, tokenizer=tokenizer, is_train=False, frac=0.1)
+    train_ds = MNLIDataset(hf_dataset=hf_ds, tokenizer=tokenizer, is_train=True, frac=0.05)
+    val_ds = MNLIDataset(hf_dataset=hf_ds, tokenizer=tokenizer, is_train=False, frac=0.05)
         
     trainer = BertCLSFineTuner(is_ddp=is_ddp,
                                device=device,
@@ -370,23 +362,24 @@ def main(rank: int, is_ddp: bool, world_size: int, num_epochs: int, batch_size: 
                                optimizer=optimizer,
                                num_epochs=num_epochs,
                                batch_size=batch_size,
-                               val_frac=0.2,
-                               checkpoint_dir=Path(Path.cwd(), "ckpt"))
+                               val_frac=1.0,
+                               checkpoint_dir=Path(Path.cwd(), "ckpt"),
+                               source_model=source_model)
     
-    trainer.finetune(is_load_checkpoint=is_load_checkpoint, layers_list=["cls_head"])
+    trainer.finetune(is_load_checkpoint=is_load_checkpoint, layers_list=["cls_head","bert.pooler","bert.encoder.transformer_blocks.11"])
     
     if is_ddp:
         ddp_cleanup()
         
 if __name__ == "__main__":
-    cuda_ids = [1]
+    cuda_ids = [0,1,2]
     cvd = ""
     for i in cuda_ids:
         cvd += str(i) + ","
         
     os.environ["CUDA_VISIBLE_DEVICES"] = cvd
-    num_epochs = 5
-    batch_size = 32
+    num_epochs = 10
+    batch_size = 16
     is_load_checkpoint = True
     is_ddp = True if len(cuda_ids) > 1 else False
     
