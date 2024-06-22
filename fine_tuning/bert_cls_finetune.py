@@ -351,8 +351,8 @@ def main(rank: int, is_ddp: bool, world_size: int, num_epochs: int, batch_size: 
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5, weight_decay=0.1)
     
     hf_ds = load_dataset("nyu-mll/multi_nli")
-    train_ds = MNLIDataset(hf_dataset=hf_ds, tokenizer=tokenizer, is_train=True, frac=0.05)
-    val_ds = MNLIDataset(hf_dataset=hf_ds, tokenizer=tokenizer, is_train=False, frac=0.05)
+    train_ds = MNLIDataset(hf_dataset=hf_ds, tokenizer=tokenizer, is_train=True, frac=1.0)
+    val_ds = MNLIDataset(hf_dataset=hf_ds, tokenizer=tokenizer, is_train=False, frac=1.0)
         
     trainer = BertCLSFineTuner(is_ddp=is_ddp,
                                device=device,
@@ -366,7 +366,7 @@ def main(rank: int, is_ddp: bool, world_size: int, num_epochs: int, batch_size: 
                                checkpoint_dir=Path(Path.cwd(), "ckpt"),
                                source_model=source_model)
     
-    trainer.finetune(is_load_checkpoint=is_load_checkpoint, layers_list=["cls_head","bert.pooler","bert.encoder.transformer_blocks.11"])
+    trainer.finetune(is_load_checkpoint=is_load_checkpoint, layers_list=["cls_head","bert.pooler","bert.encoder.transformer_blocks.11","bert.encoder.transformer_blocks.10"])
     
     if is_ddp:
         ddp_cleanup()
@@ -378,8 +378,8 @@ if __name__ == "__main__":
         cvd += str(i) + ","
         
     os.environ["CUDA_VISIBLE_DEVICES"] = cvd
-    num_epochs = 10
-    batch_size = 16
+    num_epochs = 20
+    batch_size = 32
     is_load_checkpoint = True
     is_ddp = True if len(cuda_ids) > 1 else False
     

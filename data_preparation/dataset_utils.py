@@ -1,6 +1,7 @@
 import torch, random, math
 from pathlib import Path
 from typing import Tuple, List
+import random
 
 class DatasetUtils:
     
@@ -79,6 +80,48 @@ class DatasetUtils:
         return data_dict
     
     @staticmethod
+    def qa_collate_fn(example_list: List[dict]) -> dict:
+        """examples_list[i] = dataset.__getitem__(i)"""
+
+        input_sequence_batch = []
+        start_index_batch = []
+        end_index_batch = []
+        segment_id_batch = []
+        padding_mask_batch = []
+        length_batch = []
+        
+        for elem in example_list:
+            length_batch.append(elem["length"])
+
+        max_length = max(length_batch)
+        
+        for elem in example_list:
+            input_sequence_batch.append(torch.tensor(elem["input_ids"] + [elem["[PAD]"]] * (max_length - elem["length"])))
+            start_index_batch.append(torch.tensor(elem["start_index"]))
+            end_index_batch.append(torch.tensor(elem["end_index"]))
+            segment_id_batch.append(torch.tensor(elem["token_type_ids"] + [0] * (max_length - elem["length"])))
+            padding_mask_batch.append(torch.tensor(elem["attention_mask"] + [elem["[PAD]"]] * (max_length - elem["length"])))
+            
+        input_sequence_batch = torch.stack(tensors=input_sequence_batch, dim=0)
+        start_index_batch = torch.stack(tensors=start_index_batch, dim=0)
+        end_index_batch = torch.stack(tensors=end_index_batch, dim=0)
+        segment_id_batch = torch.stack(tensors=segment_id_batch, dim=0)
+        padding_mask_batch = torch.stack(tensors=padding_mask_batch, dim=0)
+        
+        assert input_sequence_batch.shape == segment_id_batch.shape == padding_mask_batch.shape
+        
+        data_dict = {
+            "input_ids_batch": input_sequence_batch, # (b, T)
+            "start_index_batch": start_index_batch, # (b,)
+            "end_index_batch": end_index_batch, # (b,)
+            "max_length_batch": max_length, # (T)
+            "token_type_ids_batch": segment_id_batch, # (b, T)
+            "attention_mask_batch": padding_mask_batch # (b, T)
+        }
+        
+        return data_dict
+    
+    @staticmethod
     def prepare_dataloader(dataset: torch.utils.data.Dataset, is_ddp: int, batch_size: int, is_train: bool, collate_fn: "function", val_frac: float=0.2, num_workers: int=1) -> torch.utils.data.DataLoader:
         
         if is_train:
@@ -89,9 +132,9 @@ class DatasetUtils:
                 train_dl = torch.utils.data.DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, shuffle=True, collate_fn=collate_fn, drop_last=True)
         else:
             len_val_ds = len(dataset)
-            indices = torch.randperm(n=len_val_ds)[:int(len_val_ds * val_frac)]
-            val_ds = torch.utils.data.Subset(dataset=dataset, indices=indices)
-            val_dl = torch.utils.data.DataLoader(val_ds, batch_size=batch_size, num_workers=num_workers, shuffle=False, collate_fn=DatasetUtils.collate_fn, drop_last=True)
+            indices = random.sample(range(len_val_ds), k=int(len_val_ds * val_frac))
+            dataset = torch.utils.data.Subset(dataset=dataset, indices=indices)
+            val_dl = torch.utils.data.DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, shuffle=False, collate_fn=collate_fn, drop_last=True)
 
         return train_dl if is_train else val_dl     
            
