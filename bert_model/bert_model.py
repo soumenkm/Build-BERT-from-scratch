@@ -34,8 +34,8 @@ class BertEmbedding(torch.nn.Module):
         x2 = self.pos_embedding(self.pos_inputs[:, :inputs.shape[-1]].expand(*inputs.shape)) # (1, T) -> (b, T) -> (b, T, d) 
         x3 = self.seg_embedding(segment_ids) # (b, T, d)
         x = x1 + x2 + x3 # (b, T, d)
-        x = self.layernorm(x) # (b, T, d)
         x = self.dropout(x) # (b, T, d)
+        x = self.layernorm(x) # (b, T, d)
         
         return x
 
@@ -63,10 +63,11 @@ class BertAttention(torch.nn.Module):
         x = self.multihead_self_attention(query=inputs, key=inputs, value=inputs, 
                                           key_padding_mask=padding_mask, need_weights=False, 
                                           is_causal=False)[0] # (b, T, d)
-        # x = self.attention_out_projection(x) # (b, T, d)
+        # x = self.attention_out_projection(x) # (b, T, d) # not needed as pytorch automatically provides this
+        x = self.dropout(x) # (b, T, d)
         x = x + inputs # (b, T, d)
         x = self.layernorm(x) # (b, T, d)
-        x = self.dropout(x) # (b, T, d)
+        
         
         return x
         
@@ -90,9 +91,9 @@ class BertFeedForward(torch.nn.Module):
         x = self.linear1(inputs) # (b, T, d)
         x = self.gelu(x) # (b, T, d)
         x = self.linear2(x) # (b, T, d)
+        x = self.dropout(x) # (b, T, d)
         x = x + inputs # (b, T, d)
         x = self.layernorm(x) # (b, T, d)
-        x = self.dropout(x) # (b, T, d)
         
         return x
 
